@@ -281,6 +281,25 @@ HIGH_REFERENCE_EXAMPLES = [
     "backup power khatam ho raha hai hospital mein",
 ]
 
+# MEDIUM sits between HIGH and LOW: a real operational issue that needs
+# timely attention but isn't urgent/safety-related and doesn't affect a
+# critical service. Unlike CRITICAL/HIGH, there is no MEDIUM keyword list --
+# this tier is inherently a matter of degree ("recurring" / "intermittent" /
+# "needs attention soon") rather than an unambiguous exact phrase, so it is
+# only ever reached via embedding similarity, never a keyword fast path.
+MEDIUM_REFERENCE_EXAMPLES = [
+    "kai ghanton se bijli nahi hai lekin koi emergency nahi hai",
+    "voltage baar baar fluctuate ho raha hai",
+    "transformer se halki awaaz aa rahi hai kabhi kabhi",
+    "line mein baar baar trip ho raha hai pichle kuch dinon se",
+    "DT ki maintenance jald honi chahiye warna dikkat badh sakti hai",
+    "supply intermittent hai pichle do teen dino se",
+    "meter galat reading de raha hai lagta hai kharab hai",
+    "power fluctuation se ghar ke appliances kharab ho rahe hain",
+    "chhoti si sparking dikhi thi complaint kar rahe hain precaution ke liye",
+    "naye connection ke liye kaafi samay se intezaar kar rahe hain",
+]
+
 LOW_REFERENCE_EXAMPLES = [
     "meter ki reading sahi nahi aa rahi",
     "bill bahut zyada aaya hai is mahine",
@@ -496,37 +515,48 @@ if _remarks_col and _type_col:
 EMBEDDING_MODEL = None
 CRITICAL_EMBEDDINGS = None
 HIGH_EMBEDDINGS      = None
+MEDIUM_EMBEDDINGS    = None
 LOW_EMBEDDINGS       = None
 
 # Permissive by design: a false positive (extra human review) is far cheaper
 # than a false negative (a missed fire/electrocution complaint).
 CRITICAL_THRESHOLD = 0.55
 HIGH_THRESHOLD      = 0.50
+# MEDIUM_THRESHOLD is a reasonable starting point, not yet validated against
+# a labelled set the way CRITICAL/HIGH were -- tune this against real
+# labelled data before relying on it operationally.
+MEDIUM_THRESHOLD    = 0.40
 
 try:
     print("\u23f3 Loading sentence-transformer model (first run downloads ~120MB)...")
     EMBEDDING_MODEL = SentenceTransformer("paraphrase-multilingual-MiniLM-L12-v2")
 
-    # All three tiers are embedded. Keyword matching alone only catches
-    # exact-listed phrases (CRITICAL_KEYWORDS); a genuine emergency worded
-    # differently would previously only be reachable via the HIGH/LOW
-    # comparison. Embedding CRITICAL_REFERENCE_EXAMPLES closes that recall
-    # gap: keyword hits still short-circuit for speed (fast path, no
-    # embedding needed), but anything that slips past the keyword scan now
-    # also gets a chance to be recognised as CRITICAL by semantic
-    # similarity, not just HIGH.
+    # All four tiers are embedded. Keyword matching alone only catches
+    # exact-listed phrases (CRITICAL_KEYWORDS / HIGH_KEYWORDS); a genuine
+    # emergency worded differently would previously only be reachable via
+    # the HIGH/LOW comparison, and MEDIUM was not reachable by the bulk
+    # pipeline at all. Embedding CRITICAL_REFERENCE_EXAMPLES and
+    # MEDIUM_REFERENCE_EXAMPLES closes both gaps: keyword hits still
+    # short-circuit for speed (fast path, no embedding needed), but
+    # anything that slips past the keyword scan now gets a genuine
+    # four-way CRITICAL/HIGH/MEDIUM/LOW comparison, matching what /analyse's
+    # LLM classification (and the public README) already describe.
     CRITICAL_EMBEDDINGS = EMBEDDING_MODEL.encode(
         CRITICAL_REFERENCE_EXAMPLES, convert_to_numpy=True, normalize_embeddings=True
     )
     HIGH_EMBEDDINGS = EMBEDDING_MODEL.encode(
         HIGH_REFERENCE_EXAMPLES, convert_to_numpy=True, normalize_embeddings=True
     )
+    MEDIUM_EMBEDDINGS = EMBEDDING_MODEL.encode(
+        MEDIUM_REFERENCE_EXAMPLES, convert_to_numpy=True, normalize_embeddings=True
+    )
     LOW_EMBEDDINGS = EMBEDDING_MODEL.encode(
         LOW_REFERENCE_EXAMPLES, convert_to_numpy=True, normalize_embeddings=True
     )
     print(f"\u2713 Embedding model loaded. Reference vectors: "
           f"{len(CRITICAL_REFERENCE_EXAMPLES)} critical, "
-          f"{len(HIGH_REFERENCE_EXAMPLES)} high, {len(LOW_REFERENCE_EXAMPLES)} low.")
+          f"{len(HIGH_REFERENCE_EXAMPLES)} high, {len(MEDIUM_REFERENCE_EXAMPLES)} medium, "
+          f"{len(LOW_REFERENCE_EXAMPLES)} low.")
 except Exception as e:
     print(f"\u26a0  Embedding model failed to load: {e}")
     print("   Bulk triage paths will fall back to keyword-based classification.")
@@ -591,19 +621,19 @@ def keyword_scan_batch(texts: list[str]) -> list[dict]:
 
     needs_embedding is set to True ONLY for rows that are neither CRITICAL
     nor HIGH from keywords — i.e. only complaints that landed as LOW from
-    the keyword scan, where the embedding step could potentially promote
-    them to HIGH based on semantic meaning (e.g. "hospital mein light nahi"
-    without an exact keyword hit). CRITICAL and HIGH keyword results are
-    both definitive:
+    the keyword scan, where the embedding step could promote them to
+    CRITICAL, HIGH, or MEDIUM based on semantic meaning (e.g. "hospital
+    mein light nahi" without an exact keyword hit). CRITICAL and HIGH
+    keyword results are both definitive:
       - CRITICAL keywords are unambiguous safety signals; embeddings cannot
         add anything here and would only waste time.
       - HIGH keywords already flag the complaint as priority; the embedding
-        step for HIGH rows can only confirm, never downgrade (same rule as
-        the full pipeline), so there is no value in running it at upload
-        time — the result would be HIGH either way.
+        step for HIGH rows can only confirm or upgrade to CRITICAL, never
+        downgrade, so there is no value in running the HIGH/MEDIUM/LOW
+        comparison for these at upload time.
     This means embeddings are computed only for the subset of complaints
     that are neither CRITICAL nor HIGH by keyword, which in a typical
-    KESCO dataset is the large majority of routine LOW complaints, but the
+    KESCO dataset is the large majority of routine complaints, but the
     refinement only happens when a user actively filters in Urgency Triage,
     not at upload time.
     """
@@ -627,7 +657,7 @@ def refine_urgency_for_indices(df: pd.DataFrame, text_col: str, indices, embeddi
     whole uploaded file.
 
     embedding_cache is a dict on the upload record:
-    {text: (max_critical, max_high, max_low)}.
+    {text: (max_critical, max_high, max_medium, max_low)}.
     Mutates df in place (urgency/queue/method/scores columns) for any row
     in `indices` that still has needs_embedding=True, then clears that flag
     — so re-applying the same or an overlapping filter later is instant for
@@ -660,22 +690,26 @@ def refine_urgency_for_indices(df: pd.DataFrame, text_col: str, indices, embeddi
         )
         critical_scores = vecs @ CRITICAL_EMBEDDINGS.T
         high_scores     = vecs @ HIGH_EMBEDDINGS.T
-        low_scores       = vecs @ LOW_EMBEDDINGS.T
+        medium_scores   = vecs @ MEDIUM_EMBEDDINGS.T
+        low_scores      = vecs @ LOW_EMBEDDINGS.T
         for i, t in enumerate(uncached_texts):
             embedding_cache[t] = (
                 float(critical_scores[i].max()),
                 float(high_scores[i].max()),
+                float(medium_scores[i].max()),
                 float(low_scores[i].max()),
             )
 
     for idx in pending_idx:
         text = df.at[idx, text_col]
-        mc, mh, ml = embedding_cache[str(text)]
+        mc, mh, mm, ml = embedding_cache[str(text)]
         kw_level = df.at[idx, "_urgency"]  # provisional keyword-stage level
         if mc >= CRITICAL_THRESHOLD:
             level, queue = "CRITICAL", "bypass"
         elif kw_level == "HIGH" or mh >= HIGH_THRESHOLD:
             level, queue = "HIGH", "priority"
+        elif mm >= MEDIUM_THRESHOLD:
+            level, queue = "MEDIUM", "standard"
         else:
             level, queue = "LOW", "standard"
         df.at[idx, "_urgency"] = level
@@ -683,6 +717,7 @@ def refine_urgency_for_indices(df: pd.DataFrame, text_col: str, indices, embeddi
         df.at[idx, "_method"] = "keyword+embedding"
         df.at[idx, "_score_critical"] = round(mc, 3)
         df.at[idx, "_score_high"] = round(mh, 3)
+        df.at[idx, "_score_medium"] = round(mm, 3)
         df.at[idx, "_score_low"] = round(ml, 3)
         df.at[idx, "_needs_embedding"] = False
 
@@ -703,10 +738,12 @@ def triage_urgency_batch(texts: list[str]) -> list[dict]:
 
     Stage 1 (keyword) resolves CRITICAL definitively and skips embeddings
     for those rows entirely. Everything else goes through Stage 2, compared
-    against all three reference sets (CRITICAL / HIGH / LOW) so a genuine
-    emergency worded differently than any CRITICAL_KEYWORDS entry can still
-    be recovered at the CRITICAL tier, not just HIGH. A keyword-HIGH result
-    can only be confirmed or upgraded by embeddings, never downgraded.
+    against all four reference sets (CRITICAL / HIGH / MEDIUM / LOW) so a
+    genuine emergency worded differently than any CRITICAL_KEYWORDS entry
+    can still be recovered at the CRITICAL tier, and a real-but-non-urgent
+    complaint can land at MEDIUM instead of being pushed to HIGH or LOW.
+    A keyword-HIGH result can only be confirmed or upgraded, never
+    downgraded, by embeddings.
     """
     keyword_results = [rule_based_urgency(t) for t in texts]
     needs_embedding_idx = [i for i, r in enumerate(keyword_results) if r["level"] != "CRITICAL"]
@@ -735,14 +772,17 @@ def triage_urgency_batch(texts: list[str]) -> list[dict]:
     )
     critical_scores = vecs @ CRITICAL_EMBEDDINGS.T
     high_scores     = vecs @ HIGH_EMBEDDINGS.T
+    medium_scores   = vecs @ MEDIUM_EMBEDDINGS.T
     low_scores      = vecs @ LOW_EMBEDDINGS.T
     max_critical = critical_scores.max(axis=1)
     max_high     = high_scores.max(axis=1)
+    max_medium   = medium_scores.max(axis=1)
     max_low      = low_scores.max(axis=1)
 
     for u_idx, unique_text in enumerate(unique_texts):
         mc = float(max_critical[u_idx])
         mh = float(max_high[u_idx])
+        mm = float(max_medium[u_idx])
         ml = float(max_low[u_idx])
         for orig_idx in text_to_indices[unique_text]:
             kw = keyword_results[orig_idx]
@@ -750,12 +790,17 @@ def triage_urgency_batch(texts: list[str]) -> list[dict]:
                 level, queue = "CRITICAL", "bypass"
             elif kw["level"] == "HIGH" or mh >= HIGH_THRESHOLD:
                 level, queue = "HIGH", "priority"
+            elif mm >= MEDIUM_THRESHOLD:
+                level, queue = "MEDIUM", "standard"
             else:
                 level, queue = "LOW", "standard"
             final[orig_idx] = {
                 "level": level, "queue": queue, "method": "keyword+embedding",
                 "triggers": kw.get("triggers", []),
-                "scores": {"critical": round(mc, 3), "high": round(mh, 3), "low": round(ml, 3)},
+                "scores": {
+                    "critical": round(mc, 3), "high": round(mh, 3),
+                    "medium": round(mm, 3), "low": round(ml, 3),
+                },
             }
 
     return final
@@ -1323,6 +1368,7 @@ def _run_upload_analysis(upload_id: str, df: pd.DataFrame, cols: dict, filename:
         df["_needs_embedding"] = [r.get("needs_embedding", False) for r in scan_results]
         df["_score_critical"]  = None
         df["_score_high"]      = None
+        df["_score_medium"]    = None
         df["_score_low"]       = None
 
         if cols["substation"]:
