@@ -221,13 +221,29 @@ HIGH_KEYWORDS = [
 # Hinglish variants so the multilingual model can align them properly.
 #
 # Threshold tuning note:
-#   CRITICAL_THRESHOLD = 0.55 and HIGH_THRESHOLD = 0.50 are both deliberately
-#   permissive to avoid missing genuine safety complaints. A false positive
-#   (routine complaint flagged CRITICAL/HIGH) is far less harmful than a
-#   false negative (an actual fire/electrocution complaint missed). Field
-#   teams will triage from the CRITICAL queue anyway; false positives add a
-#   few extra reviews, not harm. LOW is the fallback: anything below both
-#   thresholds.
+#   CRITICAL_THRESHOLD, HIGH_THRESHOLD and MEDIUM_THRESHOLD are both
+#   deliberately permissive to avoid missing genuine safety complaints. A
+#   false positive (routine complaint flagged CRITICAL/HIGH) is far less
+#   harmful than a false negative (an actual fire/electrocution complaint
+#   missed). Field teams will triage from the CRITICAL queue anyway; false
+#   positives add a few extra reviews, not harm. LOW is the fallback:
+#   anything below all three thresholds.
+#
+# CONFIDENCE_MARGIN gates whether the embedding argmax is trusted at all.
+# When the top two tiers' scores are within this margin of each other, the
+# call is treated as ambiguous and the keyword-derived provisional level is
+# used instead (see the confidence-gate comment in triage_urgency_batch()
+# and refine_urgency_for_indices()), or, for /batch-triage specifically,
+# escalated to a targeted LLM call (see llm_urgency_check()).
+#
+# STARTING VALUE ONLY -- NOT VALIDATED. 0.03 is a conservative placeholder
+# chosen to be smaller than the margins seen in genuine CRITICAL catches
+# during testing (~0.02-0.15) while still catching some of the narrowest,
+# most ambiguous false-CRITICAL calls. Run evaluation.py's margin sweep
+# (see --sweep-margin) against a larger labeled set before trusting this
+# value in production -- picking it from 30 examples risks the same
+# overfitting problem that produced the original, rejected
+# CRITICAL_THRESHOLD=0.55.
 # ---------------------------------------------------------------------------
 
 CRITICAL_REFERENCE_EXAMPLES = [
@@ -332,6 +348,26 @@ def _safe_read(path: str, **kwargs) -> pd.DataFrame:
 def _norm(series: pd.Series) -> pd.Series:
     """Normalise a string series: strip whitespace, uppercase."""
     return series.astype(str).str.strip().str.upper()
+
+
+def _topk_similarity(scores: np.ndarray, k: int = 3) -> np.ndarray:
+    """
+    Mean of the top-k highest cosine similarities per row, instead of a bare
+    max. Real evaluation data (see evaluation.py) showed that a plain
+    `.max(axis=1)` systematically favours whichever reference set has the
+    most example sentences -- CRITICAL_REFERENCE_EXAMPLES (20 sentences) was
+    winning almost every comparison against HIGH (13), MEDIUM (10), and LOW
+    (8), even for routine complaints, purely because taking a max over more
+    candidates tends to produce a higher value by chance, independent of
+    actual semantic similarity. Averaging the top few scores instead of
+    taking a single outlier max is far less sensitive to that reference-set-
+    size bias, so tiers with different numbers of reference sentences are
+    compared more fairly. `k` is capped to the reference set's own size so
+    this still works for a set smaller than k.
+    """
+    kk = min(k, scores.shape[1])
+    top = np.partition(scores, -kk, axis=1)[:, -kk:]
+    return top.mean(axis=1)
 
 
 def _reopen_rate(total_series: pd.Series, reopen_series: pd.Series) -> pd.Series:
@@ -527,6 +563,23 @@ HIGH_THRESHOLD      = 0.50
 # labelled data before relying on it operationally.
 MEDIUM_THRESHOLD    = 0.40
 
+# Gates whether the embedding argmax (see triage_urgency_batch() and
+# refine_urgency_for_indices()) is trusted at all. When the top two tiers'
+# scores are within this margin of each other, the call is ambiguous: the
+# keyword-derived provisional level is used instead, or (in /batch-triage
+# only) the row is escalated to a targeted LLM call -- see
+# llm_urgency_check().
+#
+# STARTING VALUE ONLY -- NOT VALIDATED. 0.03 is a conservative placeholder,
+# chosen because testing showed genuine CRITICAL catches and false-positive
+# CRITICAL calls both produce similarly small margins (~0.02-0.15) on the
+# current 30-example labeled set, so no single cutoff cleanly separates
+# them yet. Run evaluation.py's margin sweep against a larger labeled set
+# before trusting this value in production -- picking it from 30 examples
+# risks the same overfitting problem that produced the original, rejected
+# CRITICAL_THRESHOLD=0.55 embedding-promotion rule.
+MIN_CONFIDENCE_MARGIN = 0.03
+
 try:
     print("\u23f3 Loading sentence-transformer model (first run downloads ~120MB)...")
     EMBEDDING_MODEL = SentenceTransformer("paraphrase-multilingual-MiniLM-L12-v2")
@@ -688,30 +741,45 @@ def refine_urgency_for_indices(df: pd.DataFrame, text_col: str, indices, embeddi
             uncached_texts, convert_to_numpy=True, normalize_embeddings=True,
             batch_size=128, show_progress_bar=False,
         )
-        critical_scores = vecs @ CRITICAL_EMBEDDINGS.T
-        high_scores     = vecs @ HIGH_EMBEDDINGS.T
-        medium_scores   = vecs @ MEDIUM_EMBEDDINGS.T
-        low_scores      = vecs @ LOW_EMBEDDINGS.T
+        critical_scores = _topk_similarity(vecs @ CRITICAL_EMBEDDINGS.T)
+        high_scores     = _topk_similarity(vecs @ HIGH_EMBEDDINGS.T)
+        medium_scores   = _topk_similarity(vecs @ MEDIUM_EMBEDDINGS.T)
+        low_scores      = _topk_similarity(vecs @ LOW_EMBEDDINGS.T)
         for i, t in enumerate(uncached_texts):
             embedding_cache[t] = (
-                float(critical_scores[i].max()),
-                float(high_scores[i].max()),
-                float(medium_scores[i].max()),
-                float(low_scores[i].max()),
+                float(critical_scores[i]),
+                float(high_scores[i]),
+                float(medium_scores[i]),
+                float(low_scores[i]),
             )
 
     for idx in pending_idx:
         text = df.at[idx, text_col]
         mc, mh, mm, ml = embedding_cache[str(text)]
         kw_level = df.at[idx, "_urgency"]  # provisional keyword-stage level
-        if mc >= CRITICAL_THRESHOLD:
-            level, queue = "CRITICAL", "bypass"
-        elif kw_level == "HIGH" or mh >= HIGH_THRESHOLD:
-            level, queue = "HIGH", "priority"
-        elif mm >= MEDIUM_THRESHOLD:
-            level, queue = "MEDIUM", "standard"
-        else:
-            level, queue = "LOW", "standard"
+
+        # BUGFIX: same argmax fix as triage_urgency_batch() -- see the
+        # detailed comment there. Picking the highest-scoring tier instead
+        # of testing thresholds in a fixed priority order.
+        scores = {"CRITICAL": mc, "HIGH": mh, "MEDIUM": mm, "LOW": ml}
+        ranked = sorted(scores.values(), reverse=True)
+        margin = ranked[0] - ranked[1]
+        best_tier = max(scores, key=scores.get)
+
+        # See the detailed comment in triage_urgency_batch(): falling back
+        # to a keyword-only level when the margin is narrow was measured to
+        # HURT CRITICAL recall (genuine catches and false positives have
+        # similarly narrow margins here), so the argmax result is always
+        # used. This function has no LLM-escalation caller today (only
+        # /batch-triage does that), so "ambiguous" is not currently acted
+        # on here -- kept for future parity if that changes.
+        is_ambiguous = margin < MIN_CONFIDENCE_MARGIN
+        level = best_tier
+
+        if kw_level == "HIGH" and level not in ("HIGH", "CRITICAL"):
+            level = "HIGH"
+        queue = {"CRITICAL": "bypass", "HIGH": "priority",
+                 "MEDIUM": "standard", "LOW": "standard"}[level]
         df.at[idx, "_urgency"] = level
         df.at[idx, "_queue"] = queue
         df.at[idx, "_method"] = "keyword+embedding"
@@ -751,14 +819,14 @@ def triage_urgency_batch(texts: list[str]) -> list[dict]:
     final = [None] * len(texts)
     for i, r in enumerate(keyword_results):
         if r["level"] == "CRITICAL":
-            final[i] = {**r, "method": "keyword"}
+            final[i] = {**r, "method": "keyword", "ambiguous": False}
 
     if not needs_embedding_idx:
         return final
 
     if EMBEDDING_MODEL is None:
         for i in needs_embedding_idx:
-            final[i] = {**keyword_results[i], "method": "keyword_fallback"}
+            final[i] = {**keyword_results[i], "method": "keyword_fallback", "ambiguous": False}
         return final
 
     text_to_indices: dict[str, list[int]] = {}
@@ -770,14 +838,13 @@ def triage_urgency_batch(texts: list[str]) -> list[dict]:
         unique_texts, convert_to_numpy=True, normalize_embeddings=True,
         batch_size=128, show_progress_bar=False,
     )
-    critical_scores = vecs @ CRITICAL_EMBEDDINGS.T
-    high_scores     = vecs @ HIGH_EMBEDDINGS.T
-    medium_scores   = vecs @ MEDIUM_EMBEDDINGS.T
-    low_scores      = vecs @ LOW_EMBEDDINGS.T
-    max_critical = critical_scores.max(axis=1)
-    max_high     = high_scores.max(axis=1)
-    max_medium   = medium_scores.max(axis=1)
-    max_low      = low_scores.max(axis=1)
+    # top-k mean, not a bare max -- see _topk_similarity() docstring for why
+    # a plain max biases toward whichever tier has the most reference
+    # sentences (CRITICAL_REFERENCE_EXAMPLES is the largest set).
+    max_critical = _topk_similarity(vecs @ CRITICAL_EMBEDDINGS.T)
+    max_high     = _topk_similarity(vecs @ HIGH_EMBEDDINGS.T)
+    max_medium   = _topk_similarity(vecs @ MEDIUM_EMBEDDINGS.T)
+    max_low      = _topk_similarity(vecs @ LOW_EMBEDDINGS.T)
 
     for u_idx, unique_text in enumerate(unique_texts):
         mc = float(max_critical[u_idx])
@@ -786,17 +853,67 @@ def triage_urgency_batch(texts: list[str]) -> list[dict]:
         ml = float(max_low[u_idx])
         for orig_idx in text_to_indices[unique_text]:
             kw = keyword_results[orig_idx]
-            if mc >= CRITICAL_THRESHOLD:
-                level, queue = "CRITICAL", "bypass"
-            elif kw["level"] == "HIGH" or mh >= HIGH_THRESHOLD:
-                level, queue = "HIGH", "priority"
-            elif mm >= MEDIUM_THRESHOLD:
-                level, queue = "MEDIUM", "standard"
-            else:
-                level, queue = "LOW", "standard"
+
+            # BUGFIX: pick the tier with the HIGHEST similarity score
+            # (argmax), not the first tier whose threshold happens to be
+            # crossed in a fixed CRITICAL -> HIGH -> MEDIUM -> LOW priority
+            # order. All four reference sets share the same power-utility
+            # domain vocabulary, so cosine similarity against CRITICAL is
+            # very often above CRITICAL_THRESHOLD even for routine LOW
+            # complaints (e.g. "meter reading galat hai" scored 0.73
+            # against CRITICAL in testing -- higher than its own LOW score
+            # would need to be distinguished by rank, not by an absolute
+            # cutoff). The old sequential-threshold check returned CRITICAL
+            # the moment mc >= CRITICAL_THRESHOLD without ever comparing
+            # that score to mh/mm/ml, so CRITICAL won almost every time
+            # regardless of which tier the text actually resembled most.
+            # Argmax only assigns a tier when it is the BEST match among
+            # the four, which is what "which reference sentences is this
+            # text most similar to" is actually supposed to mean.
+            scores = {"CRITICAL": mc, "HIGH": mh, "MEDIUM": mm, "LOW": ml}
+            ranked = sorted(scores.values(), reverse=True)
+            margin = ranked[0] - ranked[1]
+            best_tier = max(scores, key=scores.get)
+
+            # CONFIDENCE GATE: only trust the embedding argmax when it wins
+            # clearly over the runner-up tier. When two tiers are nearly
+            # tied, that is not a case where a threshold value would help --
+            # testing showed the same small margin (~0.02-0.05) shows up for
+            # BOTH genuine CRITICAL catches and false-positive escalations
+            # of routine complaints, so no single cutoff separates them
+            # cleanly on the current labeled data. Rather than trust an
+            # ambiguous embedding call, fall back to the keyword-derived
+            # provisional level (kw["level"] is "HIGH" on an exact keyword
+            # hit, or "LOW" otherwise -- CRITICAL-keyword texts never reach
+            # this stage). This defers to a signal that has already been
+            # separately validated, instead of a coin-flip embedding score.
+            # NOTE: an earlier version of this gate replaced the level with
+            # kw["level"] (a keyword-only fallback) whenever the margin was
+            # narrow. Measured against labeled data, that made things WORSE,
+            # not safer: genuine CRITICAL catches and false-positive
+            # CRITICAL calls turned out to have similarly narrow margins on
+            # this dataset (~0.02-0.05 for both), so the gate could not
+            # actually tell them apart -- it just as often discarded a
+            # correct CRITICAL catch as it caught a wrong one, and
+            # defaulting to a keyword-only LOW on a genuine emergency is the
+            # worst possible failure mode here. So: the argmax result is
+            # ALWAYS used as the level. "ambiguous" is pure metadata for the
+            # caller (used only by /batch-triage to decide whether to get a
+            # second opinion from the LLM -- see llm_urgency_check()) and
+            # never changes the classification on its own.
+            is_ambiguous = margin < MIN_CONFIDENCE_MARGIN
+            level = best_tier
+
+            # A keyword-HIGH hit is still never downgraded below HIGH.
+            if kw["level"] == "HIGH" and level not in ("HIGH", "CRITICAL"):
+                level = "HIGH"
+
+            queue = {"CRITICAL": "bypass", "HIGH": "priority",
+                     "MEDIUM": "standard", "LOW": "standard"}[level]
             final[orig_idx] = {
                 "level": level, "queue": queue, "method": "keyword+embedding",
                 "triggers": kw.get("triggers", []),
+                "ambiguous": is_ambiguous,
                 "scores": {
                     "critical": round(mc, 3), "high": round(mh, 3),
                     "medium": round(mm, 3), "low": round(ml, 3),
@@ -826,6 +943,58 @@ def strip_fences(text: str) -> str:
     text = re.sub(r"^```\s*",     "", text)
     text = re.sub(r"\s*```$",     "", text)
     return text.strip()
+
+
+def llm_urgency_check(text: str) -> Optional[str]:
+    """
+    Single-complaint LLM disambiguation for complaints the confidence gate
+    in triage_urgency_batch() flagged as "ambiguous" (top two embedding
+    tiers too close to trust -- see MIN_CONFIDENCE_MARGIN).
+
+    Deliberately used ONLY by /batch-triage, not /upload-complaints or its
+    lazy per-filter refinement (refine_urgency_for_indices). /batch-triage
+    is explicitly for a smaller, pasted-text list per its own docstring, so
+    one LLM call per ambiguous row is affordable there. A 600K-row upload
+    could have tens of thousands of ambiguous rows; calling an LLM for each
+    would reintroduce exactly the cost/latency problem the bulk paths were
+    built to avoid in the first place (see module docstring). If ambiguous-
+    row LLM escalation is ever wanted for uploads, it should be scoped the
+    same way embeddings already are there: lazily, only for whatever
+    filtered slice a user is actually viewing -- not the whole file.
+
+    Returns the urgency level as a string, or None on any failure (bad
+    JSON, network error, etc) so the caller can fall back to the
+    embedding/keyword result rather than failing the whole batch over one
+    bad LLM call.
+    """
+    system_prompt = (
+        "You are an urgency classifier for a power utility complaint system "
+        "in Kanpur, India (KESCO/DVVNL). Complaints may be in Hindi, "
+        "English, or Hinglish. Return ONLY a JSON object, no markdown, no "
+        "preamble."
+    )
+    user_prompt = f"""Classify this complaint's urgency as exactly one of: CRITICAL, HIGH, MEDIUM, LOW.
+
+CRITICAL = an active safety hazard right now (fire, sparking, exposed live wire, electrocution or injury).
+HIGH = urgent but not immediately life-threatening (hospital or essential-service outage, transformer overheating, an outage of 24+ hours).
+MEDIUM = a real, worsening problem that is not yet urgent (intermittent faults, voltage fluctuation, a fault that keeps recurring).
+LOW = a routine account, billing, or service request, or a minor issue that has already resolved.
+
+Complaint: "{text}"
+
+Return ONLY this JSON, nothing else:
+{{"urgency": "CRITICAL" or "HIGH" or "MEDIUM" or "LOW"}}"""
+
+    try:
+        raw = call_groq(system_prompt, user_prompt, max_tokens=30)
+        raw = strip_fences(raw)
+        result = json.loads(raw)
+        level = str(result.get("urgency", "")).strip().upper()
+        if level in ("CRITICAL", "HIGH", "MEDIUM", "LOW"):
+            return level
+    except Exception as e:
+        print(f"  LLM urgency check failed for one ambiguous complaint: {e}")
+    return None
 
 
 def geo_reopen_rates(substation: str = None,
@@ -1280,22 +1449,57 @@ Return ONLY this JSON — no other text:
 @app.post("/batch-triage")
 def batch_triage(req: BatchRequest):
     """
-    Two-stage bulk triage — keyword scan first (CRITICAL tier, near-zero cost),
-    then contextual embeddings for anything that passes through (HIGH vs LOW).
+    Three-stage bulk triage — keyword scan first (CRITICAL tier, near-zero
+    cost), then contextual embeddings for anything that passes through
+    (CRITICAL/HIGH/MEDIUM/LOW), then a targeted LLM call ONLY for the rows
+    the embedding stage flagged as ambiguous (see MIN_CONFIDENCE_MARGIN and
+    llm_urgency_check()).
 
-    Stage 1 (keyword): CRITICAL complaints are resolved instantly. The keyword
-    list covers unambiguous safety signals in Hindi, English, and Hinglish.
+    Stage 1 (keyword): CRITICAL complaints are resolved instantly. The
+    keyword list covers unambiguous safety signals in Hindi, English, and
+    Hinglish.
     Stage 2 (embedding): non-CRITICAL complaints are embedded and compared
-    against HIGH/LOW reference sentences. Catches semantic HIGH cases like
-    hospital outages or extended supply failures that keyword lists miss.
+    against all four reference sets. Catches semantic cases like hospital
+    outages or intermittent faults that keyword lists miss.
+    Stage 3 (LLM, targeted): when the top two tiers' embedding scores are
+    too close to trust a plain argmax call, that single row is sent to the
+    LLM for a real judgment call, instead of silently falling back to a
+    provisional keyword-derived level. This is affordable here specifically
+    because /batch-triage handles a smaller, pasted-text list -- typically
+    tens to low hundreds of complaints, so even if every one of them were
+    ambiguous, that's still a small number of LLM calls. This is NOT done
+    for /upload-complaints, where a 600K-row file could have tens of
+    thousands of ambiguous rows and an LLM call per row would defeat the
+    entire reason that path stays LLM-free (see module docstring).
 
-    No LLM call — handles hundreds of complaints in seconds.
     Falls back to keyword-only if the embedding model is unavailable.
     Returns list sorted CRITICAL -> HIGH -> MEDIUM -> LOW, with the
     classification method and similarity scores per complaint.
     """
-    results = []
     triage_results = triage_urgency_batch(req.complaints)
+
+    ambiguous_count = 0
+    llm_failures = 0
+    for i, result in enumerate(triage_results):
+        if not result.get("ambiguous"):
+            continue
+        ambiguous_count += 1
+        llm_level = llm_urgency_check(req.complaints[i])
+        if llm_level:
+            result["level"] = llm_level
+            result["queue"] = {
+                "CRITICAL": "bypass", "HIGH": "priority",
+                "MEDIUM": "standard", "LOW": "standard",
+            }[llm_level]
+            result["method"] = "keyword+embedding+llm_escalation"
+        else:
+            # LLM call failed -- keep the argmax embedding level already
+            # computed (the best available signal) rather than losing the
+            # row entirely or falling back to something worse.
+            llm_failures += 1
+            result["method"] = result.get("method", "embedding") + "+llm_escalation_failed"
+
+    results = []
     for i, (text, result) in enumerate(zip(req.complaints, triage_results)):
         entry = {
             "index":    i,
@@ -1313,9 +1517,11 @@ def batch_triage(req: BatchRequest):
     order = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}
     results.sort(key=lambda x: order.get(x["urgency"], 4))
     return {
-        "total":               len(results),
-        "complaints":          results,
-        "classification_method": "keyword+embedding" if EMBEDDING_MODEL else "keyword_fallback",
+        "total":                   len(results),
+        "complaints":              results,
+        "ambiguous_escalated_to_llm": ambiguous_count,
+        "llm_escalation_failures": llm_failures,
+        "classification_method": "keyword+embedding+llm_escalation_for_ambiguous" if EMBEDDING_MODEL else "keyword_fallback",
     }
 
 
